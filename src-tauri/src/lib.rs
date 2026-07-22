@@ -31,7 +31,7 @@ fn open_ssh(host: String, port: u16) -> Result<(), String> {
     validate_target(&host)?;
     #[cfg(target_os = "windows")]
     Command::new("cmd").args(["/C", "start", "", "ssh", "-p", &port.to_string(), &host]).spawn()
-        .map_err(|_| "OpenSSH client was not found. Install the Windows OpenSSH Client optional feature.".into())?;
+        .map_err(|_| String::from("OpenSSH client was not found. Install the Windows OpenSSH Client optional feature."))?;
     #[cfg(not(target_os = "windows"))]
     Command::new("ssh").args(["-p", &port.to_string(), &host]).spawn()
         .map_err(|_| "The OpenSSH client was not found.".into())?;
@@ -42,7 +42,7 @@ fn open_ssh(host: String, port: u16) -> Result<(), String> {
 fn open_putty(host: String, port: u16) -> Result<(), String> {
     validate_target(&host)?;
     Command::new("putty.exe").args(["-ssh", &host, "-P", &port.to_string()]).spawn()
-        .map_err(|_| "PuTTY was not found. Install it or use the OpenSSH option.".into())?;
+        .map_err(|_| String::from("PuTTY was not found. Install it or use the OpenSSH option."))?;
     Ok(())
 }
 
