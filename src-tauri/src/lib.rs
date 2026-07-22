@@ -1,7 +1,7 @@
 use serde::Serialize;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use std::{fs, io::{Read, Write}, net::IpAddr, path::PathBuf, sync::Mutex, thread};
-use sysinfo::System;
+use std::{fs, io::{Read, Write}, net::IpAddr, path::PathBuf, process::Command, sync::Mutex, thread};
+use sysinfo::{Disks, Networks, System};
 use tauri::{Emitter, State};
 
 #[derive(Serialize)]
@@ -12,6 +12,10 @@ struct SystemProfile {
     cpu_count: usize,
     total_memory_mib: u64,
     used_memory_mib: u64,
+    cpu_usage_percent: f32,
+    core_usage_percent: Vec<f32>,
+    storage_total_gib: f64,
+    storage_used_gib: f64,
 }
 
 struct SshSession {
@@ -26,12 +30,30 @@ struct SshState(Mutex<Option<SshSession>>);
 struct FileEntry { name: String, path: String, is_dir: bool, size: u64 }
 
 #[derive(Serialize)]
-struct IpInfo { ip: String, city: String, region: String, country: String, organization: String, timezone: String }
+struct IpInfo { ip: String, city: String, region: String, country: String, country_code: String, continent: String, postal: String, capital: String, organization: String, isp: String, domain: String, asn: String, timezone: String, latitude: f64, longitude: f64 }
+
+#[derive(Serialize)]
+struct NetworkTraffic { received: u64, transmitted: u64 }
+
+#[derive(Serialize)]
+struct WifiNetwork { ssid: String, bssid: String, signal: String, radio_type: String, channel: String }
+
+#[derive(Serialize)]
+struct BluetoothDevice { name: String, status: String }
+
+#[derive(Serialize)]
+struct VisibleApp { name: String, pid: u32, memory_mib: u64 }
 
 #[tauri::command]
 fn system_profile() -> SystemProfile {
     let mut system = System::new_all();
     system.refresh_all();
+    thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    system.refresh_cpu_usage();
+    let disks = Disks::new_with_refreshed_list();
+    let (storage_total, storage_available) = disks.list().iter().fold((0_u64, 0_u64), |(total, available), disk| {
+        (total.saturating_add(disk.total_space()), available.saturating_add(disk.available_space()))
+    });
     SystemProfile {
         hostname: System::host_name().unwrap_or_else(|| "Unknown host".into()),
         os: System::long_os_version().unwrap_or_else(|| std::env::consts::OS.into()),
@@ -39,6 +61,10 @@ fn system_profile() -> SystemProfile {
         cpu_count: system.cpus().len(),
         total_memory_mib: system.total_memory() / 1024 / 1024,
         used_memory_mib: system.used_memory() / 1024 / 1024,
+        cpu_usage_percent: system.global_cpu_usage(),
+        core_usage_percent: system.cpus().iter().map(|cpu| cpu.cpu_usage()).collect(),
+        storage_total_gib: storage_total as f64 / 1024_f64.powi(3),
+        storage_used_gib: storage_total.saturating_sub(storage_available) as f64 / 1024_f64.powi(3),
     }
 }
 
@@ -113,7 +139,56 @@ fn ip_lookup(ip: String) -> Result<IpInfo, String> {
         .get(url).send().and_then(|response| response.error_for_status()).map_err(|_| String::from("IP intelligence service did not respond."))?
         .json().map_err(|_| String::from("IP intelligence service returned an invalid response."))?;
     if value["success"].as_bool() != Some(true) { return Err(String::from("IP intelligence service could not resolve that address.")); }
-    Ok(IpInfo { ip: value["ip"].as_str().unwrap_or_default().into(), city: value["city"].as_str().unwrap_or("Unknown").into(), region: value["region"].as_str().unwrap_or("Unknown").into(), country: value["country"].as_str().unwrap_or("Unknown").into(), organization: value["connection"]["org"].as_str().unwrap_or("Unknown").into(), timezone: value["timezone"]["id"].as_str().unwrap_or("Unknown").into() })
+    Ok(IpInfo { ip: value["ip"].as_str().unwrap_or_default().into(), city: value["city"].as_str().unwrap_or("Unknown").into(), region: value["region"].as_str().unwrap_or("Unknown").into(), country: value["country"].as_str().unwrap_or("Unknown").into(), country_code: value["country_code"].as_str().unwrap_or("--").into(), continent: value["continent"].as_str().unwrap_or("Unknown").into(), postal: value["postal"].as_str().unwrap_or("Unknown").into(), capital: value["capital"].as_str().unwrap_or("Unknown").into(), organization: value["connection"]["org"].as_str().unwrap_or("Unknown").into(), isp: value["connection"]["isp"].as_str().unwrap_or("Unknown").into(), domain: value["connection"]["domain"].as_str().unwrap_or("Unknown").into(), asn: value["connection"]["asn"].as_i64().map(|asn| format!("AS{asn}")).unwrap_or_else(|| String::from("Unknown")), timezone: value["timezone"]["id"].as_str().unwrap_or("Unknown").into(), latitude: value["latitude"].as_f64().unwrap_or(0.0), longitude: value["longitude"].as_f64().unwrap_or(0.0) })
+}
+
+#[tauri::command]
+fn network_traffic() -> NetworkTraffic {
+    let networks = Networks::new_with_refreshed_list();
+    let (received, transmitted) = (&networks).into_iter()
+        .filter(|(name, _)| !name.to_lowercase().contains("loopback"))
+        .fold((0_u64, 0_u64), |(rx, tx), (_, network)| (rx.saturating_add(network.total_received()), tx.saturating_add(network.total_transmitted())));
+    NetworkTraffic { received, transmitted }
+}
+
+#[tauri::command]
+fn wifi_scan() -> Result<Vec<WifiNetwork>, String> {
+    let output = Command::new("netsh").args(["wlan", "show", "networks", "mode=bssid"]).output()
+        .map_err(|_| String::from("Windows Wi-Fi tools are unavailable."))?;
+    if !output.status.success() { return Err(String::from("Wi-Fi scan failed. Confirm that a wireless adapter is enabled.")); }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut networks = Vec::new(); let mut ssid = String::new(); let mut bssid = String::new(); let mut signal = String::from("--"); let mut radio_type = String::from("--"); let mut channel = String::from("--");
+    let commit = |networks: &mut Vec<WifiNetwork>, ssid: &str, bssid: &str, signal: &str, radio_type: &str, channel: &str| { if !bssid.is_empty() { networks.push(WifiNetwork { ssid: if ssid.is_empty() { String::from("Hidden network") } else { ssid.into() }, bssid: bssid.into(), signal: signal.into(), radio_type: radio_type.into(), channel: channel.into() }); } };
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with("SSID ") && line.contains(" : ") && !line.starts_with("SSID BSSID") { ssid = line.split_once(" : ").map(|(_, value)| value.trim().into()).unwrap_or_default(); }
+        else if line.starts_with("BSSID ") && line.contains(" : ") { commit(&mut networks, &ssid, &bssid, &signal, &radio_type, &channel); bssid = line.split_once(" : ").map(|(_, value)| value.trim().into()).unwrap_or_default(); signal = String::from("--"); radio_type = String::from("--"); channel = String::from("--"); }
+        else if !bssid.is_empty() && line.starts_with("Signal") { signal = line.split_once(':').map(|(_, value)| value.trim().into()).unwrap_or_else(|| signal.clone()); }
+        else if !bssid.is_empty() && line.starts_with("Radio type") { radio_type = line.split_once(':').map(|(_, value)| value.trim().into()).unwrap_or_else(|| radio_type.clone()); }
+        else if !bssid.is_empty() && line.starts_with("Channel") { channel = line.split_once(':').map(|(_, value)| value.trim().into()).unwrap_or_else(|| channel.clone()); }
+    }
+    commit(&mut networks, &ssid, &bssid, &signal, &radio_type, &channel);
+    Ok(networks)
+}
+
+#[tauri::command]
+fn bluetooth_inventory() -> Result<Vec<BluetoothDevice>, String> {
+    let output = Command::new("powershell").args(["-NoProfile", "-Command", "Get-PnpDevice -Class Bluetooth | Select-Object FriendlyName,Status | ConvertTo-Json -Compress"]).output()
+        .map_err(|_| String::from("Windows Bluetooth inventory is unavailable."))?;
+    if !output.status.success() { return Err(String::from("Bluetooth inventory failed. Confirm that Bluetooth is available.")); }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| String::from("Bluetooth inventory returned an invalid response."))?;
+    let items = value.as_array().cloned().unwrap_or_else(|| vec![value]);
+    Ok(items.into_iter().filter_map(|item| Some(BluetoothDevice { name: item["FriendlyName"].as_str()?.into(), status: item["Status"].as_str().unwrap_or("Unknown").into() })).collect())
+}
+
+#[tauri::command]
+fn visible_apps() -> Result<Vec<VisibleApp>, String> {
+    let output = Command::new("powershell").args(["-NoProfile", "-Command", "Get-Process | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object ProcessName,Id,WS | ConvertTo-Json -Compress"]).output()
+        .map_err(|_| String::from("Windows application inventory is unavailable."))?;
+    if !output.status.success() { return Err(String::from("Windows application inventory failed.")); }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| String::from("Windows application inventory returned an invalid response."))?;
+    let items = value.as_array().cloned().unwrap_or_else(|| vec![value]);
+    Ok(items.into_iter().filter_map(|item| Some(VisibleApp { name: item["ProcessName"].as_str()?.into(), pid: item["Id"].as_u64()? as u32, memory_mib: item["WS"].as_u64().unwrap_or(0) / 1024 / 1024 })).collect())
 }
 
 fn forward_ssh_output<R: Read + Send + 'static>(mut stream: R, app: tauri::AppHandle) {
@@ -150,7 +225,7 @@ fn validate_target(host: &str) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(SshState(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![system_profile, start_ssh, start_local_shell, write_ssh, stop_ssh, list_directory, read_text_file, write_text_file, ip_lookup])
+        .invoke_handler(tauri::generate_handler![system_profile, start_ssh, start_local_shell, write_ssh, stop_ssh, list_directory, read_text_file, write_text_file, ip_lookup, network_traffic, wifi_scan, bluetooth_inventory, visible_apps])
         .run(tauri::generate_context!())
         .expect("error while running Spectra");
 }
