@@ -1,4 +1,5 @@
-# Spectra
+# Spectra - The best way to larp
+
 
 Spectra is a local-first desktop operations console for authorized SIGINT-lab and cybersecurity workflows. It is intentionally an administration and observation surface—not an exploitation tool.
 
