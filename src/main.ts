@@ -119,6 +119,7 @@ const persistScrollback = () => {
 let activeWorldLocation = { latitude: 0, longitude: 0 };
 let trafficRate = { received: 0, transmitted: 0 };
 let trafficTotals: NetworkTraffic | undefined;
+const cpuHistory: number[][] = [];
 const networkHistory: Array<{ received: number; transmitted: number }> = [];
 
 const formatTraffic = (bytes: number) => bytes < 1024 ? `${bytes} B/S` : bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB/S` : `${(bytes / 1024 / 1024).toFixed(1)} MB/S`;
@@ -155,16 +156,18 @@ function renderNetworkGraph() {
 function renderCpuHeatmap(coreUsage: number[]) {
   const grid = document.querySelector<HTMLDivElement>("#cpu-core-grid");
   if (!grid) return;
-  grid.style.setProperty("--columns", String(Math.ceil(Math.sqrt(coreUsage.length))));
+  if (!cpuHistory.length || cpuHistory.length !== coreUsage.length) {
+    cpuHistory.length = 0;
+    for (let core = 0; core < coreUsage.length; core++) cpuHistory.push([]);
+  }
+  coreUsage.forEach((usage, index) => { cpuHistory[index].push(usage); if (cpuHistory[index].length > 32) cpuHistory[index].shift(); });
   grid.replaceChildren();
-  for (let core = 0; core < coreUsage.length; core++) {
-    const usage = coreUsage[core];
-    const cell = document.createElement("i");
-    cell.className = "cpu-core-cell";
-    cell.style.setProperty("--level", `${13 + Math.round(Math.min(100, usage) * .72)}%`);
-    cell.innerHTML = `<span>C${String(core + 1).padStart(2, "0")}</span><b>${usage.toFixed(0)}%</b>`;
-    cell.title = `Core ${core + 1}: ${usage.toFixed(1)}%`;
-    grid.append(cell);
+  for (let core = 0; core < cpuHistory.length; core++) {
+    const row = document.createElement("div"); row.className = "cpu-core-row";
+    const label = document.createElement("span"); label.textContent = `C${String(core + 1).padStart(2, "0")}`; row.append(label);
+    const cells = document.createElement("div"); cells.className = "cpu-core-cells";
+    for (const usage of cpuHistory[core]) { const cell = document.createElement("i"); cell.style.setProperty("--level", `${13 + Math.round(Math.min(100, usage) * .72)}%`); cell.title = `Core ${core + 1}: ${usage.toFixed(1)}%`; cells.append(cell); }
+    row.append(cells); grid.append(row);
   }
 }
 function updateWorldView() {
@@ -181,9 +184,10 @@ function updateWorldView() {
   const server = project(activeWorldLocation.latitude, activeWorldLocation.longitude);
   if (server.z > 0) { const load = Math.min(1, Math.log10(trafficRate.received + trafficRate.transmitted + 1) / 6), pillar = 15 + load * radius * 0.86, topX = server.x + pillar * 0.23, topY = server.y - pillar; const gradient = ctx.createLinearGradient(server.x, server.y, topX, topY); gradient.addColorStop(0, "#20b9b0"); gradient.addColorStop(1, "#b8fff1"); ctx.strokeStyle = gradient; ctx.lineWidth = 2 + load * 3; ctx.shadowColor = "#66ffe5"; ctx.shadowBlur = 11; ctx.beginPath(); ctx.moveTo(server.x, server.y); ctx.lineTo(topX, topY); ctx.stroke(); ctx.shadowBlur = 0; ctx.fillStyle = "#c7fff4"; ctx.beginPath(); ctx.arc(server.x, server.y, 3.5, 0, Math.PI * 2); ctx.fill(); }
   document.querySelector("#traffic-readout")!.textContent = `UP / DOWN ${formatTraffic(trafficRate.transmitted)} / ${formatTraffic(trafficRate.received)}`;
+  updateNetworkResource();
 }
 setInterval(async () => {
-  try { const totals = await invoke<NetworkTraffic>("network_traffic"); if (trafficTotals) trafficRate = { received: Math.max(0, totals.received - trafficTotals.received), transmitted: Math.max(0, totals.transmitted - trafficTotals.transmitted) }; trafficTotals = totals; updateNetworkResource(); updateWorldView(); }
+  try { const totals = await invoke<NetworkTraffic>("network_traffic"); if (trafficTotals) trafficRate = { received: Math.max(0, totals.received - trafficTotals.received), transmitted: Math.max(0, totals.transmitted - trafficTotals.transmitted) }; trafficTotals = totals; updateWorldView(); }
   catch { /* telemetry is non-critical */ }
 }, 1000);
 window.addEventListener("resize", updateWorldView);
